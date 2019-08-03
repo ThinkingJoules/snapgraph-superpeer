@@ -37,90 +37,67 @@ function LMDB(config){
         create: true,
         keyIsBuffer:true
     })
-    this.putData = function(root,putBuffer){
+    this.putData = function(root,soul,putO,expire,msgIDs,cb){
         //puts = {soul:{[msgIDs]:[],putO:{gunPutObj(partial)}}
-        let txn = self.env.beginTxn({readOnly:true})
-        let results = {}
-        let toWrite = []
-        let i = 0
-        for (const [soul,{msgIDs,putO}] of putBuffer.entries()) {
-            results[soul] = {range:[i],msgIDs}
-            try {
-                if(snapUtil.ALL_ADDRESSES.test(soul)){// || IS_INDEX_SOUL
-                    console.log('DATA SET NODE')
-                    putDataSet(soul,putO)
-                }else{
-                    putDataSoul(soul,putO)
-                }
-                results[soul].range.push(i)//i is incremented, [i,j] is segment of batchwrite results that indicate if soul succeeded
-            } catch (error) {//if the error comes from txn does it break everything?
-                console.log("ERROR IN PUT DECOMPOSITION:",{soul,error})
-            }
-            putBuffer.delete(soul)
+        let txn = self.env.beginTxn()
+        try {
+            putDataSoul(soul,putO,expire)
+            txn.commit()
+            cb(false,true)
+            sendAcks(false)
+            return
+        } catch (error) {
+            console.log("ERROR IN TXN",error)
+            txn.abort()
+            cb(error,false)
+            sendAcks(error)
         }
-        txn.commit()
-        self.env.batchWrite(toWrite,{keyIsBuffer:true},function(error,resArray){
-            if(resArray){
-                for (const soul in results) {
-                    const {range,msgIDs} = results[soul];
-                    let fail = /[^0]/.test(resArray.slice(...range).join(''))
-                    for (const msgID of msgIDs) {
-                        root.on('in', {
-                            '@': msgID,
-                            ok: !fail,
-                            err: fail
-                        });
-                    }
-                }
+        function sendAcks(error){
+            for (const msgID of msgIDs) {
+                root.on('in', {
+                    '@': msgID,
+                    ok: !error,
+                    err: (error === false) ? error : error.toString()
+                });
             }
-            if(error){console.log("ERROR IN BATCH PUT:",error)}
-        })
-        function putDataSoul(soul,put){
+            
+        }
+        function putDataSoul(soul,put,exp){
             let soulKey = makeKey(soul)
-            let pvals = txn.getBinary(self.dbi,soulKey) || Buffer.alloc(0)//p collection so we can delete all things if needed
-            let newP = ''
+            let rawPs = txn.getBinary(self.dbi,soulKey)
+            let pvals = rawPs && JSON.parse(rawPs.toString(ENCODING)) || []
             let now = Date.now()
             for (const p in put) {
                 if (p === '_')continue
-                if(!pvals.includes(Buffer.from(p,ENCODING)))newP+=p+RS
-                let val = put[p],str = IS_DATA
-                let ham = snapUtil.getValue(['_','>',p],put) || now
-                //if(typeof val === 'object' && val !== null && !Array.isArray(val))continue//regular souls will stringify links '{'#':'someSoul'}
-                if(typeof val === 'string')str+= NULL+val
-                else str += IS_STRINGIFY+JSON.stringify(val)
-                str += ESC + ham
-                //str is ISDATA + STRINGFY_FLAG + [string buffer] + ESC + [ham string buffer]
-                let encodedVal = Buffer.from(str,ENCODING)
-                //txn.putBinary(self.dbi,makeKey(soul,p),encodedVal,{keyIsBuffer:true})
-                toWrite.push([self.dbi,makeKey(soul,p),encodedVal])
-                i++
-            }
-            let pBuffer = Buffer.from(pvals.toString(ENCODING)+newP,ENCODING)//newP+'\0' 
-            if(newP.length){
-                //txn.putBinary(self.dbi,soulKey,pBuffer,{keyIsBuffer:true})
-                toWrite.push([self.dbi,soulKey,pBuffer]) 
-                i++
-            }
-        }
-        function putDataSet(soul,put){//only specific souls are stored like this
-            let dbKey = makeKey(soul)
-            let existing = txn.getBinary(self.dbi,dbKey,{keyIsBuffer:true})
-            if(existing === null)existing = Buffer.from("{}",ENCODING)
-            let obj = JSON.parse(existing.toString(ENCODING))
-            for (const thing in put) {
-                if (thing === '_')continue
-                const boolean = put[thing];
-                if(boolean !== null){//add to set
-                    obj[key] = boolean
-                    snapUtil.setValue(['_','>',key],snapUtil.getValue(['_','>',key],put)||Date.now(),obj)//set HAM value OR make it NOW
-                }else{//remove from set,this may get re-added if other things persist it, all snapsuperPeers will attempt to prune list.
-                    delete obj[key]
-                    if(obj['_'] && obj['_']['>'] && obj['_']['>'][key])delete obj['_']['>'][key]
+                let val = put[p]
+                let expire = exp[p]
+                let addrKey = makeKey(soul,p)
+                if(expire && now>expire){
+                    let exists = txn.getBinary(self.dbi,addrKey)
+                    if(exists !== null)txn.del(self.dbi,addrKey)
+                    continue
+                }
+                if(val !== null){
+                    if(!pvals.includes(p))pvals.push(p)
+                    let str
+                    let ham = snapUtil.getValue(['_','>',p],put) || now
+                    if(typeof val === 'string')str = NULL+val
+                    else str = IS_STRINGIFY+JSON.stringify(val)
+                    str += ESC + ham
+                    if(expire)str+=RS+String(expire)
+                    //str is STRINGFY_FLAG + [string buffer] + ESC + [ham string buffer] [optional: + RS + expire string buffer]
+                    let encodedVal = Buffer.from(str,ENCODING)
+                    txn.putBinary(self.dbi,makeKey(soul,p),encodedVal,{keyIsBuffer:true})
+                }else{
+                    if(pvals.includes(p)){
+                        snapUtil.removeFromArr(pvals,pvals.indexOf(p))
+                        txn.del(self.dbi,makeKey(soul,p),{keyIsBuffer:true})
+                    }
                 }
             }
-            //txn.putBinary(self.dbi,dbKey,Buffer.from(GUN_NODE+JSON.stringify(obj),ENCODING),{keyIsBuffer:true})
-            toWrite.push([self.dbi,dbKey,Buffer.from(GUN_NODE+JSON.stringify(obj),ENCODING)])
-            i++
+            pvals.sort()//make lexical??
+            txn.putBinary(self.dbi,soulKey,Buffer.from(JSON.stringify(pvals),ENCODING),{keyIsBuffer:true})
+            txn.putBinary(self.dbi,makeKey(soul,'length'),Buffer.from(String(pvals.length),ENCODING),{keyIsBuffer:true})//# of non-null-value keys
         }
     }
     this.getBatch = function(root,batch,cb){//untested, doesn't work
@@ -178,18 +155,11 @@ function LMDB(config){
                 put = JSON.parse(raw.toString(ENCODING,1))//reassign put
             }else{//decomposed gun node
                 hasOne = false
-                let props = []
-                if(prop && Array.isArray(prop)){
+                let props
+                if(prop && Array.isArray(prop)){//this isn't ever used. only valid gun calls come through here.. this is in snapGet/getBatch api
                     props = prop
                 }else{
-                    let raw = txn.getBinary(self.dbi,soulKey,{keyIsBuffer:true})
-                    let i = 0
-                    while(true){
-                        let j = raw.indexOf(RS,i+1,ENCODING)
-                        if(j-i < 0)break
-                        props.push(raw.toString(ENCODING,i,j))
-                        i = j+2//1 for uft8, 2 for utf16le?
-                    }
+                    props = JSON.parse(raw.toString(ENCODING))
                 }
                 //console.log('GETTING',soul,props)
                 for (const prop of props) {
@@ -203,26 +173,42 @@ function LMDB(config){
         return (hasOne) ? put : null
         
     }
-    this.getProp = function (soul,prop,putObj,txn){
+    this.getProp = function (soul,prop,msgPut,txn){
         let addr = makeKey(soul,prop)
         let value = txn.getBinary(self.dbi,addr,{keyIsBuffer:true})
-        if(value === null)return//prop is non-existent, so don't put anything in the obj
-        let meta = putObj[soul]['_']['>']
-        let val,ham
-        if(value[0] === Buffer.from(IS_DATA,ENCODING)[0]){
+        let meta = msgPut[soul]['_']['>']
+        let val,ham,exp
+        let now = Date.now()
+        if(value === null){
+            val = null
+            ham = now //should alway overwrite old graph data if the get got to the disk?
+            exp = Infinity
+        }else{
             let eSplit = value.indexOf(Buffer.from(ESC,ENCODING),0,ENCODING)
-            meta[prop] = ham = value.toString(ENCODING,eSplit+2)*1//get HAM to number
-            if(value[2] === Buffer.from(IS_STRINGIFY,ENCODING)[0]){
-                val = JSON.parse(value.toString(ENCODING,4,eSplit))
+            let exSplit = value.indexOf(Buffer.from(RS,ENCODING),0,ENCODING)
+            exSplit = (exSplit === -1) ? 0 : exSplit
+            ham = value.toString(ENCODING,eSplit+2,(exSplit||value.length))*1//get HAM to number
+            exp = (exSplit) ? value.toString(ENCODING,exSplit+2)*1 : Infinity
+            if(value[0] === Buffer.from(IS_STRINGIFY,ENCODING)[0]){
+                val = JSON.parse(value.toString(ENCODING,2,eSplit))
             } else {
-                val = value.toString(ENCODING,4,eSplit)
+                val = value.toString(ENCODING,2,eSplit)
             }
-            putObj[soul][prop] = val
-        }else{//is full node (like a set?) 
-            console.log('THIS SHOULD NEVER RUN I THINK IT CAN BE REMOVED')
-            putObj[soul] = JSON.parse(value.toString(ENCODING,2))
         }
-        return [val,ham]//let it know that it found something so we don't return an empty node
+        if(now<exp){
+            msgPut[soul][prop] = val
+            meta[prop] = ham
+            return [val,ham]//let it know that it found something so we don't return an empty node
+        }
+        console.log("REMOVING EXPIRED VALUE")
+        txn.del(self.dbi,addr)
+    }
+    this.getLength = function(soul){
+        let txn = self.env.beginTxn({ readOnly: true })
+        let val = txn.getBinary(self.dbi,makeKey(soul,'length'),{keyIsBuffer:true})
+        val = val && val.toString(ENCODING)*1 || 0
+        txn.commit()
+        return val
     }
 }
 function makeKey(soul,prop){
