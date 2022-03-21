@@ -27,7 +27,7 @@
   "homepage": "https://github.com/ThinkingJoules/snapgraph-superpeer#readme",
   "dependencies": {
     "gun": "^0.2019.726",
-    "node-lmdb": "^0.7.0",
+    "node-lmdb": "^0.9.7",
     "snapgraph": "file:../snapgraph"
   }
 }
